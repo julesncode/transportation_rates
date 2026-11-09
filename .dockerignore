@@ -9,5 +9,9 @@ __pycache__
 .mypy_cache
 .ruff_cache
 artifacts
+logs
+_session_recovery
+attachments
+docs
 *.md
 !README.md
