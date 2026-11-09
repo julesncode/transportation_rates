@@ -1,0 +1,3 @@
+# Зависимости для тестов (только target test в docker/pipeline.Dockerfile).
+-r requirements.txt
+pytest>=8,<9

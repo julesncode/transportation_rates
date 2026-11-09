@@ -1,0 +1,181 @@
+name: smart-logistics
+
+# Общие переменные PostgreSQL для сервиса БД.
+x-postgres-env: &postgres-env
+  POSTGRES_DB: ${POSTGRES_DB:-deals_bigdata}
+  POSTGRES_USER: ${POSTGRES_USER:-postgres}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+
+# ЕДИНСТВЕННОЕ место, где заданы значения по умолчанию для приложения.
+# Python-код читает переменные без дефолтов (etl/config.py) и падает, если
+# чего-то не хватает: расхождение двух наборов дефолтов даёт тихие баги.
+# .env не обязателен — Compose сам подставляет значения из него в ${VAR},
+# а без файла работают значения по умолчанию отсюда.
+x-app-env: &app-env
+  POSTGRES_HOST: ${POSTGRES_HOST:-db}
+  POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+  POSTGRES_DB: ${POSTGRES_DB:-deals_bigdata}
+  POSTGRES_USER: ${POSTGRES_USER:-postgres}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+  # psql внутри контейнеров читает пароль из этой переменной
+  PGPASSWORD: ${POSTGRES_PASSWORD:-postgres}
+  N_PRICES: ${N_PRICES:-300000}
+  AS_OF_DATE: ${AS_OF_DATE:-2026-10-26}
+  FRESHNESS_WINDOW_DAYS: ${FRESHNESS_WINDOW_DAYS:-30}
+  ETL_WINDOW_DAYS: ${ETL_WINDOW_DAYS:-7}
+  RANDOM_SEED: ${RANDOM_SEED:-42}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  # владелец каталогов artifacts/ и logs/ (совпадает с UID в образе Airflow)
+  AIRFLOW_UID: ${AIRFLOW_UID:-50000}
+
+# Общая конфигурация приложений (код и переменные одинаковы).
+x-app: &app
+  environment: *app-env
+  depends_on:
+    db:
+      condition: service_healthy
+
+# Общая конфигурация Airflow-сервисов.
+x-airflow: &airflow
+  <<: *app
+  build:
+    context: .
+    dockerfile: docker/airflow.Dockerfile
+  image: smart-logistics-airflow:local
+  environment:
+    <<: *app-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/project/dags
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: Europe/Moscow
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "false"
+    PYTHONPATH: /opt/airflow/project
+  volumes:
+    # Модель и метрики общие с образом пайплайна.
+    - ./artifacts:/opt/airflow/project/artifacts
+    # Логи задач переживают пересоздание контейнера — без них разбор падений невозможен.
+    - ./logs:/opt/airflow/logs
+
+services:
+  # Основное хранилище: PostgreSQL 17.
+  db:
+    image: postgres:17
+    container_name: sl_db
+    environment: *postgres-env
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  # Ручной запуск одного шага пайплайна: docker compose run --rm pipeline python -m etl.cli check
+  pipeline:
+    <<: *app
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: docker/pipeline.Dockerfile
+      target: base
+    image: smart-logistics-pipeline:local
+    container_name: sl_pipeline
+    volumes:
+      - ./artifacts:/app/artifacts
+
+  # Тесты: отдельный образ с pytest; поднимается только явно.
+  tests:
+    <<: *app
+    profiles: ["tools"]
+    build:
+      context: .
+      dockerfile: docker/pipeline.Dockerfile
+      target: test
+    image: smart-logistics-pipeline-test:local
+    container_name: sl_tests
+    command: ["pytest"]
+
+  # Подготовка каталогов на хосте: Docker создаёт отсутствующие bind-mount
+  # каталоги как root:root, а Airflow пишет под UID 50000. Без этого шага на
+  # нативном Linux `ml_train` не сможет сохранить модель.
+  fs-init:
+    image: alpine:3.20
+    container_name: sl_fs_init
+    user: "0:0"
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - "mkdir -p /mnt/artifacts /mnt/logs && (chown -R ${AIRFLOW_UID:-50000}:0 /mnt/artifacts /mnt/logs || true)"
+    volumes:
+      - ./artifacts:/mnt/artifacts
+      - ./logs:/mnt/logs
+
+  # Однократная инициализация: источник, DDL хранилища, метаданные Airflow.
+  airflow-init:
+    <<: *airflow
+    container_name: sl_airflow_init
+    restart: "no"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        python -m etl.cli ensure-airflow-db
+        python -m etl.cli init-source
+        python -m etl.cli migrate
+        airflow db migrate
+        airflow users create \
+          --username admin --password admin \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@example.com || true
+    depends_on:
+      fs-init:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+
+  airflow-webserver:
+    <<: *airflow
+    container_name: sl_airflow_web
+    command: webserver
+    ports:
+      - "${AIRFLOW_WEB_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow
+    container_name: sl_airflow_scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Однократный прогон DAG, чтобы `docker compose up` заканчивался данными в БД.
+  bootstrap:
+    <<: *airflow
+    container_name: sl_bootstrap
+    restart: "no"
+    entrypoint: /bin/bash
+    command: ["/opt/airflow/project/docker/bootstrap.sh"]
+    depends_on:
+      airflow-webserver:
+        condition: service_healthy
+      airflow-scheduler:
+        condition: service_started
+
+volumes:
+  pgdata:
